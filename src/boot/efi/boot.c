@@ -55,6 +55,8 @@ typedef struct {
         EFI_STATUS (*call)(VOID);
         BOOLEAN no_autoselect;
         BOOLEAN non_unique;
+        UINTN initrd_count;
+        CHAR16 **initrds;
 } ConfigEntry;
 
 typedef struct {
@@ -836,6 +838,15 @@ static BOOLEAN menu_run(Config *config, ConfigEntry **chosen_entry, CHAR16 *load
         return run;
 }
 
+static VOID config_entry_add_initrd(ConfigEntry *entry, CHAR16 *filename) {
+        if (entry->initrds == NULL)
+                entry->initrds = AllocatePool(sizeof(CHAR16 *));
+        else
+                entry->initrds = ReallocatePool(entry->initrds, sizeof(CHAR16 *) * entry->initrd_count,
+                                                sizeof(CHAR16 *) * (entry->initrd_count + 1));
+        entry->initrds[entry->initrd_count++] = StrDuplicate(filename);
+}
+
 static VOID config_add_entry(Config *config, ConfigEntry *entry) {
         if ((config->entry_count & 15) == 0) {
                 UINTN i;
@@ -850,12 +861,22 @@ static VOID config_add_entry(Config *config, ConfigEntry *entry) {
         config->entries[config->entry_count++] = entry;
 }
 
+static VOID config_entry_free_initrds(ConfigEntry *entry) {
+        UINTN i;
+
+        for (i = 0; i < entry->initrd_count; ++i)
+                FreePool(entry->initrds[i]);
+        FreePool(entry->initrds);
+        entry->initrd_count = 0;
+}
+
 static VOID config_entry_free(ConfigEntry *entry) {
         FreePool(entry->title_show);
         FreePool(entry->title);
         FreePool(entry->machine_id);
         FreePool(entry->loader);
         FreePool(entry->options);
+        config_entry_free_initrds(entry);
 }
 
 static BOOLEAN is_digit(CHAR16 c) {
@@ -1108,6 +1129,7 @@ static VOID config_entry_add_from_file(Config *config, EFI_HANDLE *device, CHAR1
                         _cleanup_freepool_ CHAR16 *new = NULL;
 
                         new = stra_to_path(value);
+                        config_entry_add_initrd(entry, new);
                         if (initrd) {
                                 CHAR16 *s;
 
@@ -1157,7 +1179,8 @@ static VOID config_entry_add_from_file(Config *config, EFI_HANDLE *device, CHAR1
                         entry->options = initrd;
                         initrd = NULL;
                 }
-        }
+        } else
+                config_entry_free_initrds(entry);
 
         entry->device = device;
         entry->file = StrDuplicate(file);
@@ -1634,11 +1657,35 @@ static VOID config_entry_add_linux(Config *config, EFI_LOADED_IMAGE *loaded_imag
         uefi_call_wrapper(linux_dir->Close, 1, linux_dir);
 }
 
-static EFI_STATUS image_start(EFI_HANDLE parent_image, const Config *config, const ConfigEntry *entry) {
+static EFI_STATUS measure_file(EFI_FILE *root_dir, CHAR16 *path) {
+        EFI_STATUS err;
+        CHAR8 *content;
+        UINTN content_size;
+
+        err = file_read(root_dir, path, 0, 0, &content, &content_size);
+        if (EFI_ERROR(err)) {
+                Print(L"Unable to read image \"%s\": %r", path, err);
+                uefi_call_wrapper(BS->Stall, 1, 200 * 1000);
+                return err;
+        }
+
+        err = tpm_log_event(SD_TPM_PCR, (EFI_PHYSICAL_ADDRESS) content, content_size, path);
+        if (EFI_ERROR(err)) {
+                Print(L"Unable to add image measurement \"%s\": %r", path, err);
+                uefi_call_wrapper(BS->Stall, 1, 200 * 1000);
+        }
+        FreePool(content);
+        return err;
+}
+
+static EFI_STATUS image_start(EFI_HANDLE parent_image, const Config *config, const ConfigEntry *entry, EFI_FILE *root_dir) {
         EFI_HANDLE image;
         _cleanup_freepool_ EFI_DEVICE_PATH *path = NULL;
         CHAR16 *options;
         EFI_STATUS err;
+#if ENABLE_TPM
+        UINTN i;
+#endif
 
         path = FileDevicePath(entry->device, entry->loader);
         if (!path) {
@@ -1653,6 +1700,12 @@ static EFI_STATUS image_start(EFI_HANDLE parent_image, const Config *config, con
                 uefi_call_wrapper(BS->Stall, 1, 3 * 1000 * 1000);
                 return err;
         }
+
+#if ENABLE_TPM
+        for (i = 0; i < entry->initrd_count; i++) {
+                measure_file(root_dir, entry->initrds[i]);
+        }
+#endif
 
         if (config->options_edit)
                 options = config->options_edit;
@@ -1867,7 +1920,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *sys_table) {
                 efivar_set(L"LoaderEntrySelected", entry->file, FALSE);
 
                 uefi_call_wrapper(BS->SetWatchdogTimer, 4, 5 * 60, 0x10000, 0, NULL);
-                err = image_start(image, &config, entry);
+                err = image_start(image, &config, entry, root_dir);
                 if (EFI_ERROR(err)) {
                         graphics_mode(FALSE);
                         Print(L"\nFailed to execute %s (%s): %r\n", entry->title, entry->loader, err);
